@@ -15,6 +15,7 @@
 #include "../db/DatabaseManager.h"
 #include "../dao/SpeedDAO.h"
 #include "../dao/SpliceDAO.h"
+#include "../dao/SpliceWindowDAO.h"
 #include "../dao/FlawDAO.h"
 #include "../dao/StopDAO.h"
 #include "../dao/CompareDAO.h"
@@ -22,14 +23,20 @@
 #include "../dao/RemoveDAO.h"
 
 #include <cstdlib>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <vector>
 
 // ============================================
 // 辅助：清理所有表
 // ============================================
 static void cleanAllTables() {
     auto& dbm = db::DatabaseManager::instance();
-    dbm.execute("DELETE FROM SPEED");
     dbm.execute("DELETE FROM SPLICE");
+    dbm.execute("DELETE FROM SPLICE_WINDOW_EVENT");
+    dbm.execute("DELETE FROM SPLICE_WINDOW");
+    dbm.execute("DELETE FROM SPEED");
     dbm.execute("DELETE FROM FLAW");
     dbm.execute("DELETE FROM STOP");
     dbm.execute("DELETE FROM COMPARE");
@@ -375,6 +382,271 @@ TEST(SpliceDAO_Count) {
     s.url = "/a"; s.last = 0; s.flag = 0; s.stop = 0;
     dao.insert(s);
     ASSERT_EQ(dao.count(), 1);
+}
+
+// ============================================
+// 5.5 SpliceWindowDAO 窗口生命周期测试
+// ============================================
+static entity::Splice makeSpliceInWindow(int windowId, int last = 1, int flag = 0, int stop = 0) {
+    entity::Splice s;
+    s.location = 1000.0f; s.distance = 120.0f; s.time = "30";
+    s.url = "/window/" + std::to_string(windowId) + ".jpg";
+    s.last = last; s.flag = flag; s.stop = stop; s.windowId = windowId;
+    return s;
+}
+
+static bool dbErrorContains(const std::function<void()>& fn, const std::string& part) {
+    try {
+        fn();
+    } catch (const db::DatabaseException& e) {
+        return std::string(e.what()).find(part) != std::string::npos;
+    }
+    return false;
+}
+
+TEST(SpliceWindow_OpenRecordsOpenedEvent) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    int id = wdao.openWindow("A班", "张工");
+    ASSERT_GT(id, 0);
+
+    auto w = wdao.findById(id);
+    ASSERT_TRUE(w.has_value());
+    ASSERT_STR_EQ(w->status, "OPEN");
+    ASSERT_STR_EQ(w->shiftCode, "A班");
+    ASSERT_STR_EQ(w->oper, "张工");
+    ASSERT_FALSE(w->openedAt.empty());
+
+    auto events = wdao.findEvents(id);
+    ASSERT_EQ(events.size(), (size_t)1);
+    ASSERT_STR_EQ(events[0].event, "OPENED");
+    ASSERT_STR_EQ(events[0].oper, "张工");
+}
+
+TEST(SpliceWindow_PauseResumeTransitionsAndTimeline) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    int id = wdao.openWindow("A班", "张工");
+
+    ASSERT_EQ(wdao.pauseWindow(id, "张工"), 1);
+    auto paused = wdao.findById(id);
+    ASSERT_STR_EQ(paused->status, "PAUSED");
+    ASSERT_FALSE(paused->pausedAt.empty());
+
+    ASSERT_EQ(wdao.resumeWindow(id, "李工"), 1);
+    auto resumed = wdao.findById(id);
+    ASSERT_STR_EQ(resumed->status, "OPEN");
+    ASSERT_FALSE(resumed->resumedAt.empty());
+
+    auto events = wdao.findEvents(id);
+    ASSERT_EQ(events.size(), (size_t)3);
+    ASSERT_STR_EQ(events[0].event, "OPENED");
+    ASSERT_STR_EQ(events[1].event, "PAUSED");
+    ASSERT_STR_EQ(events[2].event, "RESUMED");
+}
+
+TEST(SpliceWindow_IllegalTransitionsRejected) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    int id = wdao.openWindow("A班", "张工");
+
+    // OPEN 状态不能 resume
+    ASSERT_TRUE(dbErrorContains([&] { wdao.resumeWindow(id, "张工"); }, "Illegal window transition"));
+
+    wdao.pauseWindow(id, "张工");
+    // PAUSED 状态不能再次 pause
+    ASSERT_TRUE(dbErrorContains([&] { wdao.pauseWindow(id, "张工"); }, "Illegal window transition"));
+
+    // 关闭后一切迁移均被数据库拒绝（终态）
+    auto closed = wdao.closeWindow(id, "张工");
+    ASSERT_TRUE(closed.closedNow);
+    ASSERT_TRUE(dbErrorContains([&] { wdao.pauseWindow(id, "张工"); }, "CLOSED"));
+    ASSERT_TRUE(dbErrorContains([&] { wdao.resumeWindow(id, "张工"); }, "CLOSED"));
+}
+
+TEST(SpliceWindow_InsertRejectedWhenPaused) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    dao::SpliceDAO sdao;
+    int id = wdao.openWindow("A班", "张工");
+
+    // OPEN 时写入被接受
+    ASSERT_GT(sdao.insert(makeSpliceInWindow(id)), 0);
+
+    wdao.pauseWindow(id, "张工");
+    // 暂停期间新接缝被数据库触发器拒绝
+    ASSERT_TRUE(dbErrorContains([&] { sdao.insert(makeSpliceInWindow(id)); }, "not OPEN"));
+
+    wdao.resumeWindow(id, "张工");
+    // 恢复后写入重新被接受
+    ASSERT_GT(sdao.insert(makeSpliceInWindow(id)), 0);
+}
+
+TEST(SpliceWindow_StateWriteRejectedAfterClose) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    dao::SpliceDAO sdao;
+    int id = wdao.openWindow("A班", "张工");
+    int spliceId = sdao.insert(makeSpliceInWindow(id, 1, 0, 0));
+
+    wdao.closeWindow(id, "张工");
+
+    // 接班人交班后，后到的状态写入必须被拒绝（旧接缝无法伪装成当前停机候选）
+    ASSERT_TRUE(dbErrorContains([&] { sdao.updateFlags(spliceId, 1, 1); }, "not OPEN"));
+    ASSERT_TRUE(dbErrorContains([&] { sdao.updateLast(spliceId, 0); }, "not OPEN"));
+}
+
+TEST(SpliceWindow_QueriesOnlyReturnOpenWindowData_CrossShift) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    dao::SpliceDAO sdao;
+
+    // A 班遗留窗口：已关闭，但里面留着 last=1、stop=1 的旧接缝（接班误认来源）
+    int winA = wdao.openWindow("A班", "张工");
+    int aSplice = sdao.insert(makeSpliceInWindow(winA, 1, 1, 1));
+    wdao.closeWindow(winA, "张工");
+
+    // B 班开窗：新接缝在 OPEN 窗口内
+    int winB = wdao.openWindow("B班", "李工");
+    sdao.insert(makeSpliceInWindow(winB, 1, 1, 1));
+
+    // 三个业务查询都只返回所在窗口 OPEN 的数据
+    auto active = sdao.findActive();
+    ASSERT_EQ(active.size(), (size_t)1);
+    ASSERT_EQ(active[0].windowId, winB);
+
+    auto ready = sdao.findReadyToStop();
+    ASSERT_EQ(ready.size(), (size_t)1);
+    ASSERT_EQ(ready[0].windowId, winB);
+
+    auto stoppable = sdao.findStoppable();
+    ASSERT_EQ(stoppable.size(), (size_t)1);
+    ASSERT_EQ(stoppable[0].windowId, winB);
+
+    // 旧接缝仍可通过 findById / findByWindow 复盘读取（读取接口不被破坏）
+    ASSERT_TRUE(sdao.findById(aSplice).has_value());
+    ASSERT_EQ(sdao.findByWindow(winA).size(), (size_t)1);
+
+    // 可按班次定位窗口
+    auto shiftA = wdao.findByShift("A班");
+    ASSERT_EQ(shiftA.size(), (size_t)1);
+    ASSERT_STR_EQ(shiftA[0].status, "CLOSED");
+}
+
+TEST(SpliceWindow_CloseIsIdempotentSameResult) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    int id = wdao.openWindow("A班", "张工");
+
+    auto first = wdao.closeWindow(id, "张工");
+    ASSERT_TRUE(first.closedNow);
+    ASSERT_STR_EQ(first.closedBy, "张工");
+    ASSERT_FALSE(first.closedAt.empty());
+
+    // 重复关闭（甚至换人）返回同一结果，不产生新写入
+    auto second = wdao.closeWindow(id, "李工");
+    ASSERT_FALSE(second.closedNow);
+    ASSERT_STR_EQ(second.status, "CLOSED");
+    ASSERT_STR_EQ(second.closedBy, first.closedBy);
+    ASSERT_STR_EQ(second.closedAt, first.closedAt);
+
+    // CLOSED 事件只有一条
+    auto events = wdao.findEvents(id);
+    size_t closedEvents = 0;
+    for (auto& e : events) if (e.event == "CLOSED") closedEvents++;
+    ASSERT_EQ(closedEvents, (size_t)1);
+}
+
+TEST(SpliceWindow_ConcurrentCloseTwoOperators) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    dao::SpliceDAO sdao;
+    int id = wdao.openWindow("A班", "张工");
+    sdao.insert(makeSpliceInWindow(id, 1, 1, 0));
+
+    auto& dbm = db::DatabaseManager::instance();
+    auto sessionA = dbm.openSession();
+    auto sessionB = dbm.openSession();
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    dao::WindowCloseResult r1, r2;
+
+    auto closer = [&](std::shared_ptr<db::Session> sess, const std::string& op,
+                      dao::WindowCloseResult* out) {
+        ready.fetch_add(1);
+        while (!go.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        dao::SpliceWindowDAO local;
+        *out = local.closeWindowOn(*sess, id, op);
+    };
+
+    std::thread t1(closer, sessionA, "张工", &r1);
+    std::thread t2(closer, sessionB, "李工", &r2);
+    while (ready.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    go.store(true);
+    t1.join();
+    t2.join();
+
+    // 恰好一人真正关窗，另一人拿到幂等的同一结果
+    ASSERT_NE(r1.closedNow, r2.closedNow);
+    ASSERT_STR_EQ(r1.status, "CLOSED");
+    ASSERT_STR_EQ(r2.status, "CLOSED");
+    ASSERT_STR_EQ(r1.closedBy, r2.closedBy);
+    ASSERT_STR_EQ(r1.closedAt, r2.closedAt);
+    ASSERT_TRUE(r1.closedBy == "张工" || r1.closedBy == "李工");
+
+    // 数据库里只产生一条 CLOSED 事件
+    auto events = wdao.findEvents(id);
+    size_t closedEvents = 0;
+    for (auto& e : events) if (e.event == "CLOSED") closedEvents++;
+    ASSERT_EQ(closedEvents, (size_t)1);
+
+    sessionA->close();
+    sessionB->close();
+}
+
+TEST(SpliceWindow_LastValidStatusSnapshotFrozenOnClose) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    dao::SpliceDAO sdao;
+    int id = wdao.openWindow("A班", "张工");
+
+    int s1 = sdao.insert(makeSpliceInWindow(id, 1, 0, 0));
+    auto w1 = wdao.findById(id);
+    ASSERT_STR_EQ(w1->lastStatus, "DETECTED");
+
+    sdao.updateFlags(s1, 1, 0);
+    auto w2 = wdao.findById(id);
+    ASSERT_STR_EQ(w2->lastStatus, "READY");
+
+    int s2 = sdao.insert(makeSpliceInWindow(id, 0, 1, 1));
+    auto w3 = wdao.findById(id);
+    ASSERT_STR_EQ(w3->lastStatus, "STOPPABLE");
+    ASSERT_EQ(w3->lastSpliceId, s2);
+
+    // 关窗后快照定格，供接班人复盘最后一次有效状态
+    wdao.closeWindow(id, "张工");
+    auto frozen = wdao.findById(id);
+    ASSERT_STR_EQ(frozen->lastStatus, "STOPPABLE");
+    ASSERT_EQ(frozen->lastSpliceId, s2);
+    ASSERT_FALSE(frozen->closedAt.empty());
+}
+
+TEST(SpliceWindow_ClearLastDoesNotTouchClosedWindow) {
+    cleanAllTables();
+    dao::SpliceWindowDAO wdao;
+    dao::SpliceDAO sdao;
+    int winA = wdao.openWindow("A班", "张工");
+    int aSplice = sdao.insert(makeSpliceInWindow(winA, 1, 0, 0));
+    int winB = wdao.openWindow("B班", "李工");
+    int bSplice = sdao.insert(makeSpliceInWindow(winB, 1, 0, 0));
+    wdao.closeWindow(winA, "张工");
+
+    int affected = sdao.clearAllLast();
+    ASSERT_EQ(affected, 1);  // 仅 OPEN 的 B班窗口记录被清理
+    ASSERT_EQ(sdao.findById(bSplice)->last, 0);
+    // CLOSED 窗口记录的 last 定格不变
+    ASSERT_EQ(sdao.findById(aSplice)->last, 1);
 }
 
 // ============================================

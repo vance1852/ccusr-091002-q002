@@ -18,11 +18,17 @@
 #include "db/DatabaseManager.h"
 #include "dao/SpeedDAO.h"
 #include "dao/SpliceDAO.h"
+#include "dao/SpliceWindowDAO.h"
 #include "dao/FlawDAO.h"
 #include "dao/StopDAO.h"
 #include "dao/CompareDAO.h"
 #include "dao/HistoryDAO.h"
 #include "dao/RemoveDAO.h"
+
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <memory>
 
 using namespace std;
 
@@ -81,41 +87,188 @@ static void demoSpeed(dao::SpeedDAO& speedDao) {
     printResult("DELETE id=" + to_string(id), affected > 0);
 }
 
-static void demoSplice(dao::SpliceDAO& spliceDao) {
-    printSeparator("SPLICE 接缝表 CRUD");
+static void printSpliceRow(const entity::Splice& s) {
+    cout << "      - splice id=" << s.id << " window=" << s.windowId
+         << " last=" << s.last << " flag=" << s.flag << " stop=" << s.stop
+         << " distance=" << s.distance << endl;
+}
 
+// 演示窗口过滤效果，并解释记录为何出现/被排除
+static void printScopedQueries(dao::SpliceDAO& spliceDao) {
+    auto active = spliceDao.findActive();
+    cout << "    当前接头 findActive()      -> " << active.size() << " 条" << endl;
+    for (auto& s : active) printSpliceRow(s);
+
+    auto ready = spliceDao.findReadyToStop();
+    cout << "    准备停机 findReadyToStop()  -> " << ready.size() << " 条" << endl;
+    for (auto& s : ready) printSpliceRow(s);
+
+    auto stoppable = spliceDao.findStoppable();
+    cout << "    可停机   findStoppable()    -> " << stoppable.size() << " 条" << endl;
+    for (auto& s : stoppable) printSpliceRow(s);
+}
+
+static void printWindowTimeline(dao::SpliceWindowDAO& wdao, int windowId) {
+    auto events = wdao.findEvents(windowId);
+    cout << "    窗口 " << windowId << " 生命周期轨迹:" << endl;
+    for (auto& e : events) {
+        cout << "        " << e.eventAt << "  " << e.event
+             << "  by " << (e.oper.empty() ? "(系统)" : e.oper) << endl;
+    }
+}
+
+static entity::Splice makeDemoSplice(int windowId, float distance, int last, int flag, int stop) {
     entity::Splice s;
     s.location = 1500.0f;
-    s.distance = 320.5f;
+    s.distance = distance;
     s.time = "45";
-    s.url = "/data/splice/img_001.jpg";
-    s.last = 1;
-    s.flag = 0;
-    s.stop = 0;
-    int id = spliceDao.insert(s);
-    printResult("INSERT splice (id=" + to_string(id) + ")", id > 0);
+    s.url = "/data/splice/win" + to_string(windowId) + "_" + to_string(distance) + ".jpg";
+    s.last = last;
+    s.flag = flag;
+    s.stop = stop;
+    s.windowId = windowId;
+    return s;
+}
 
-    auto found = spliceDao.findById(id);
-    printResult("SELECT by id", found.has_value());
-    if (found) {
-        cout << "    location=" << found->location << ", distance=" << found->distance
-             << ", time=" << found->time << endl;
+// ============================================
+// SPLICE 接缝检测窗口生命周期演示
+// ============================================
+static void demoSplice(dao::SpliceDAO& spliceDao, dao::SpliceWindowDAO& windowDao) {
+    printSeparator("SPLICE 接缝检测窗口生命周期（开启/暂停/恢复/关闭）");
+
+    // 保证演示可重复执行：先清理接缝与窗口数据
+    db::DatabaseManager::instance().execute("DELETE FROM SPLICE");
+    db::DatabaseManager::instance().execute("DELETE FROM SPLICE_WINDOW_EVENT");
+    db::DatabaseManager::instance().execute("DELETE FROM SPLICE_WINDOW");
+
+    // ------------------------------------------------------------
+    // 场景一：跨班次查询 —— 接班人不应把上一班遗留接缝当成当前停机候选
+    // ------------------------------------------------------------
+    cout << "\n  [场景一] 跨班次查询（A班关窗交接 -> B班开窗接班）" << endl;
+
+    cout << "\n  -- A班：张工开窗，检测到接缝并推进到可停机 --" << endl;
+    int winA = windowDao.openWindow("A班", "张工");
+    cout << "    A班窗口 id=" << winA << " 开启（状态 OPEN，时间戳由数据库记录）" << endl;
+    int aSplice = spliceDao.insert(makeDemoSplice(winA, 320.5f, 1, 0, 0));
+    spliceDao.updateFlags(aSplice, 1, 0);   // 准备停机
+    spliceDao.updateFlags(aSplice, 1, 1);   // 可停机
+    cout << "    A班接缝 id=" << aSplice << " 已推进为 last=1 flag=1 stop=1" << endl;
+
+    cout << "\n  -- 此时查询：三个接口都能看到 A班接缝（窗口 OPEN）--" << endl;
+    printScopedQueries(spliceDao);
+
+    cout << "\n  -- A班下班，张工关闭窗口；窗口保留最后一次有效状态供复盘 --" << endl;
+    auto closedA = windowDao.closeWindow(winA, "张工");
+    cout << "    关闭结果: closedNow=" << (closedA.closedNow ? "true" : "false")
+         << ", closedBy=" << closedA.closedBy << ", closedAt=" << closedA.closedAt << endl;
+    auto snapshotA = windowDao.findById(winA);
+    cout << "    定格快照: last_status=" << snapshotA->lastStatus
+         << "（" << snapshotA->lastStatusAt << "）, last_splice_id=" << snapshotA->lastSpliceId << endl;
+    printWindowTimeline(windowDao, winA);
+
+    cout << "\n  -- B班接班：李工开新窗，检测到自己的接缝 --" << endl;
+    int winB = windowDao.openWindow("B班", "李工");
+    int bSplice = spliceDao.insert(makeDemoSplice(winB, 210.0f, 1, 1, 0));
+    cout << "    B班窗口 id=" << winB << "，新接缝 id=" << bSplice << "（last=1 flag=1）" << endl;
+
+    cout << "\n  -- 接班人当前查询：A班 stop=1 的旧接缝被排除，只出现B班窗口内数据 --" << endl;
+    printScopedQueries(spliceDao);
+    cout << "    说明: A班接缝 id=" << aSplice << " 的窗口为 CLOSED，故不出现在任何当前查询；" << endl;
+    cout << "          但它仍可通过 findById/findByWindow 复盘读取，历史不丢失。" << endl;
+
+    // ------------------------------------------------------------
+    // 场景二：非法状态迁移 + 关闭窗口后迟到的状态写入被拒绝
+    // ------------------------------------------------------------
+    cout << "\n  [场景二] 非法迁移与迟到写入被数据库拒绝" << endl;
+    int winC = windowDao.openWindow("C班", "王工");
+
+    cout << "    尝试 OPEN 状态直接恢复(resume)：" << endl;
+    try {
+        windowDao.resumeWindow(winC, "王工");
+        cout << "      [异常] 未被拒绝！" << endl;
+    } catch (const db::DatabaseException& e) {
+        cout << "      [拒绝] " << e.what() << endl;
     }
 
-    // 查询有效接头
-    auto active = spliceDao.findActive();
-    cout << "  Active splices: " << active.size() << endl;
+    windowDao.pauseWindow(winC, "王工");
+    cout << "    窗口已暂停 PAUSED。暂停期间尝试写入新接缝：" << endl;
+    try {
+        spliceDao.insert(makeDemoSplice(winC, 99.0f, 1, 0, 0));
+        cout << "      [异常] 未被拒绝！" << endl;
+    } catch (const db::DatabaseException& e) {
+        cout << "      [拒绝] " << e.what() << endl;
+    }
 
-    // 更新标志
-    spliceDao.updateFlags(id, 1, 1);
-    printResult("UPDATE flags (flag=1, stop=1)", true);
+    windowDao.resumeWindow(winC, "王工");
+    int cSplice = spliceDao.insert(makeDemoSplice(winC, 300.0f, 1, 0, 0));
+    cout << "    恢复 OPEN 后写入接缝 id=" << cSplice << " 成功（暂停期写入此前已被拒）。" << endl;
 
-    // 清除 last
-    spliceDao.clearAllLast();
-    printResult("CLEAR all last flags", true);
+    windowDao.closeWindow(winC, "王工");
+    cout << "    窗口已关闭。模拟一条“后到的状态上报”（旧接缝补报准备停机）：" << endl;
+    try {
+        spliceDao.updateFlags(cSplice, 1, 1);
+        cout << "      [异常] 迟到写入竟然成功！" << endl;
+    } catch (const db::DatabaseException& e) {
+        cout << "      [拒绝] " << e.what() << endl;
+    }
 
-    spliceDao.deleteById(id);
-    printResult("DELETE", true);
+    cout << "    再尝试把 CLOSED 窗口暂停（非法迁移）：" << endl;
+    try {
+        windowDao.pauseWindow(winC, "接班人");
+        cout << "      [异常] 未被拒绝！" << endl;
+    } catch (const db::DatabaseException& e) {
+        cout << "      [拒绝] " << e.what() << endl;
+    }
+
+    cout << "\n    重复关闭（换人再关一次）——返回首次关闭的同一结果：" << endl;
+    auto again = windowDao.closeWindow(winC, "接班人");
+    cout << "      第二次关闭: closedNow=" << (again.closedNow ? "true" : "false")
+         << ", status=" << again.status << ", closedBy=" << again.closedBy
+         << ", closedAt=" << again.closedAt << endl;
+    printWindowTimeline(windowDao, winC);
+    cout << "      （CLOSED 事件仅一条，重复关闭不产生新写入）" << endl;
+
+    // ------------------------------------------------------------
+    // 场景三：两名操作员同时关窗（各自独立连接）
+    // ------------------------------------------------------------
+    cout << "\n  [场景三] 两名操作员同时关闭同一窗口（并发，先关先得）" << endl;
+    int winD = windowDao.openWindow("D班", "赵工");
+    spliceDao.insert(makeDemoSplice(winD, 150.0f, 1, 1, 1));
+
+    auto& dbm = db::DatabaseManager::instance();
+    auto sessA = dbm.openSession();
+    auto sessB = dbm.openSession();
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    dao::WindowCloseResult rA, rB;
+    auto concurrentClose = [&](std::shared_ptr<db::Session> sess,
+                               const std::string& op, dao::WindowCloseResult* out) {
+        ready.fetch_add(1);
+        while (!go.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        dao::SpliceWindowDAO localDao;
+        *out = localDao.closeWindowOn(*sess, winD, op);
+    };
+    std::thread t1(concurrentClose, sessA, "赵工", &rA);
+    std::thread t2(concurrentClose, sessB, "钱工", &rB);
+    while (ready.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    go.store(true);
+    t1.join();
+    t2.join();
+
+    cout << "    赵工结果: closedNow=" << (rA.closedNow ? "true" : "false")
+         << ", closedBy=" << rA.closedBy << ", closedAt=" << rA.closedAt << endl;
+    cout << "    钱工结果: closedNow=" << (rB.closedNow ? "true" : "false")
+         << ", closedBy=" << rB.closedBy << ", closedAt=" << rB.closedAt << endl;
+    cout << "    => 恰好一人先关先得(closedNow=true)，另一人拿到同一 closedBy/closedAt；" << endl;
+    cout << "       数据库行锁(FOR UPDATE)串行化，CLOSED 事件只有一条。" << endl;
+    printWindowTimeline(windowDao, winD);
+
+    sessA->close();
+    sessB->close();
+
+    cout << "\n  当前所有查询（场景一/三的窗口均已关闭，只剩 B班窗口 OPEN）：" << endl;
+    printScopedQueries(spliceDao);
 }
 
 static void demoFlaw(dao::FlawDAO& flawDao) {
@@ -284,6 +437,7 @@ int main() {
         // 4. 初始化 DAO
         dao::SpeedDAO speedDao;
         dao::SpliceDAO spliceDao;
+        dao::SpliceWindowDAO spliceWindowDao;
         dao::FlawDAO flawDao;
         dao::StopDAO stopDao;
         dao::CompareDAO compareDao;
@@ -292,7 +446,7 @@ int main() {
 
         // 5. 执行各表 CRUD 演示
         demoSpeed(speedDao);
-        demoSplice(spliceDao);
+        demoSplice(spliceDao, spliceWindowDao);
         demoFlaw(flawDao);
         demoStop(stopDao);
         demoCompare(compareDao);

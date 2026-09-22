@@ -23,4 +23,4 @@ docker compose logs -f backend
 
 ## 数据范围
 
-初始化脚本创建 SPEED、SPLICE、FLAW、STOP、COMPARE、HISTORY 和 REMOVE 七张表。字段含义、默认值和索引以 SQL 脚本为准；应用通过 DAO 执行增删改查并在关键操作处记录日志。
+初始化脚本创建 SPEED、SPLICE、SPLICE_WINDOW、SPLICE_WINDOW_EVENT、FLAW、STOP、COMPARE、HISTORY 和 REMOVE 九张表。SPLICE 接缝归属于有明确状态（OPEN/PAUSED/CLOSED）与起止时间的检测窗口；只有 OPEN 窗口接受接缝写入并出现在当前接头/准备停机/可停机查询中，关闭窗口后迟到的写入由数据库触发器拒绝，重复关窗幂等返回首次结果，窗口关闭后定格最后一次有效状态并保留生命周期事件供跨班次复盘。字段含义、默认值和索引以 SQL 脚本为准；应用通过 DAO 执行增删改查并在关键操作处记录日志。

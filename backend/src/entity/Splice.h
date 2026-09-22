@@ -12,6 +12,7 @@ namespace entity {
         int last = 0;             // 当前检测接头标志，1有效
         int flag = 0;             // 准备标志，不为0则准备停机
         int stop = 0;             // 停机标志，不为0则可以停机
+        int windowId = 0;         // 所属检测窗口ID，0/NULL 表示未纳入窗口管理的历史数据
     };
 
 } // namespace entity

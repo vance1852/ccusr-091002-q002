@@ -10,8 +10,11 @@ namespace dao {
     class BaseDAO {
     protected:
         db::DatabaseManager& db() {
-            return db::DatabaseManager::instance();
+            return conn_ ? *conn_ : db::DatabaseManager::instance();
         }
+
+        // 绑定独立连接（多操作员并发场景），默认使用全局单例连接
+        void useConnection(db::DatabaseManager* conn) { conn_ = conn; }
 
         // 安全转义字符串
         std::string esc(const std::string& val) {
@@ -55,6 +58,9 @@ namespace dao {
             std::string v = getVal(row, key);
             return v.empty() ? 0.0f : std::stof(v);
         }
+
+    private:
+        db::DatabaseManager* conn_ = nullptr;  // 为空时回退到全局单例连接
     };
 
 } // namespace dao

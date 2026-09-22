@@ -36,8 +36,20 @@ namespace db {
         // 初始化连接
         void init(const config::DatabaseConfig& cfg);
 
+        // 创建独立连接（调用方独占，用于多操作员并发等多连接场景）
+        static std::shared_ptr<DatabaseManager> openConnection(const config::DatabaseConfig& cfg) {
+            auto mgr = std::shared_ptr<DatabaseManager>(new DatabaseManager());
+            mgr->init(cfg);
+            return mgr;
+        }
+
         // 关闭连接
         void close();
+
+        // 事务控制（单连接内串行使用）
+        void beginTransaction() { execute("START TRANSACTION"); }
+        void commit() { execute("COMMIT"); }
+        void rollback() { execute("ROLLBACK"); }
 
         // 执行非查询 SQL (INSERT/UPDATE/DELETE)，返回受影响行数
         int execute(const std::string& sql);
@@ -54,9 +66,10 @@ namespace db {
         // 检查连接是否存活
         bool isConnected() const;
 
+        ~DatabaseManager();
+
     private:
         DatabaseManager() = default;
-        ~DatabaseManager();
 
         DatabaseManager(const DatabaseManager&) = delete;
         DatabaseManager& operator=(const DatabaseManager&) = delete;

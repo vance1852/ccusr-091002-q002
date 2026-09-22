@@ -24,6 +24,8 @@ if(NOT MYSQL_LIBRARY)
     message(FATAL_ERROR "MySQL client library not found. Set -DMYSQL_DIR=<path>")
 endif()
 
+find_package(Threads REQUIRED)
+
 message(STATUS "MySQL include: ${MYSQL_INCLUDE_DIR}")
 message(STATUS "MySQL library: ${MYSQL_LIBRARY}")
 
@@ -57,13 +59,13 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${MYSQL_INCLUDE_DIR}
 )
-target_link_libraries(${PROJECT_NAME} PRIVATE ${MYSQL_LIBRARY})
+target_link_libraries(${PROJECT_NAME} PRIVATE ${MYSQL_LIBRARY} Threads::Threads)
 
 target_include_directories(IndustrialInspectionTest PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${MYSQL_INCLUDE_DIR}
 )
-target_link_libraries(IndustrialInspectionTest PRIVATE ${MYSQL_LIBRARY})
+target_link_libraries(IndustrialInspectionTest PRIVATE ${MYSQL_LIBRARY} Threads::Threads)
 
 # CTest 支持
 enable_testing()

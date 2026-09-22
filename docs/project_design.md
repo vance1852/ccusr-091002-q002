@@ -37,6 +37,7 @@ erDiagram
     }
     SPLICE {
         INT id PK "主键"
+        INT window_id FK "所属检测窗口"
         FLOAT location "当前位置"
         FLOAT distance "距离维修区距离"
         VARCHAR time "倒计时时间"
@@ -44,6 +45,23 @@ erDiagram
         TINYINT last "当前检测接头标志"
         TINYINT flag "准备标志"
         TINYINT stop "停机标志"
+    }
+    SPLICE_WINDOW {
+        INT id PK "主键"
+        VARCHAR label "窗口标签（班次/产线）"
+        VARCHAR state "OPEN/PAUSED/CLOSED"
+        DATETIME opened_at "开启时间"
+        DATETIME closed_at "关闭时间，未关闭为NULL"
+        INT version "状态版本号"
+    }
+    SPLICE_WINDOW_EVENT {
+        BIGINT id PK "主键"
+        INT window_id FK "所属窗口"
+        VARCHAR action "OPEN/PAUSE/RESUME/CLOSE"
+        VARCHAR from_state "迁移前状态"
+        VARCHAR to_state "迁移后状态"
+        VARCHAR actor "操作员"
+        DATETIME created_at "发生时间"
     }
     FLAW {
         BIGINT id PK "主键"
@@ -96,7 +114,23 @@ erDiagram
     SPLICE ||--o{ COMPARE : "接缝对比"
     FLAW ||--o{ HISTORY : "损伤归档"
     FLAW ||--o{ REMOVE : "损伤移除"
+    SPLICE_WINDOW ||--o{ SPLICE : "窗口包含接缝"
+    SPLICE_WINDOW ||--o{ SPLICE_WINDOW_EVENT : "窗口状态迁移审计"
 ```
+
+### 检测窗口状态机
+
+```
+OPEN --pause--> PAUSED --resume--> OPEN
+OPEN --close--> CLOSED（终态）
+PAUSED --close--> CLOSED
+```
+
+- 同一时刻至多一个 OPEN 窗口（生成列唯一索引 `uq_window_open_singleton`）。
+- 运行查询（当前接头/准备停机/可停机）只返回 OPEN 窗口的数据；`findById`/`findAll` 不过滤，保留最后有效状态供复盘。
+- 写入（插入/标志更新）仅 OPEN 窗口可写；关闭后迟到的写入由 DAO 与触发器双层拒绝。
+- 关闭幂等：重复/并发关闭返回同一 `closed_at` 与 `version`，审计表恰好一条 CLOSE。
+- 全部迁移由触发器 `trg_window_state_guard` 校验，并落入 `SPLICE_WINDOW_EVENT` 审计表。
 
 ## 3. 模块清单
 

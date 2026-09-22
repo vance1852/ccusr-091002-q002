@@ -5,6 +5,7 @@ namespace entity {
 
     struct Splice {
         int id = 0;
+        int windowId = 0;         // 所属检测窗口，0 表示插入时自动归属当前 OPEN 窗口
         float location = 0.0f;    // 当前位置
         float distance = 0.0f;    // 距离维修区距离
         std::string time;          // 倒计时时间（秒）
